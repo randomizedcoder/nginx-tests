@@ -93,9 +93,12 @@ for my $case (@cases) {
 
 $t->stop();
 $t->run();
-my $restored = http_get('/paired');
-like($restored, qr/^X-Cache: HIT\r?$/mi, 'fine cache entry survives restart');
-like($restored, qr/^Age-Ms: \d+\r?$/mi, 'restored entry reports total age');
+# The time the cache was not running is unaccounted for, so a stored fine
+# entry is fetched again and not reused or served stale.
+like(http_get('/paired'), qr/^X-Cache: EXPIRED\r?$/mi,
+    'fine cache entry is not reused after restart');
+like(http_get('/paired'), qr/^X-Cache: HIT\r?$/mi,
+    'entry fetched after restart is reused');
 
 like(http_get('/validate'), qr/^X-Cache: MISS\r?$/mi, 'fill conditional entry');
 my $deadline = time() + 5;
