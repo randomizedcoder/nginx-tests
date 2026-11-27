@@ -110,6 +110,7 @@ while (time() < $deadline) {
 }
 like($validated, qr/^X-Cache: REVALIDATED\r?$/mi, 'origin validated cached body');
 like($validated, qr/stable representation\z/, '304 retains the representation');
-like(http_get('/validate'), qr/^X-Cache: MISS\r?$/mi, 'refill after fine 304');
+like(http_get('/validate'), qr/^X-Cache: HIT\r?$/mi,
+    'entry is reused after a fine 304');
 
 ###############################################################################

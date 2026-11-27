@@ -119,6 +119,34 @@ my @cases = (
                     age => qr/^0$/, age_ms => undef } },
 );
 
+# Each row sends its requests after the start of a new second and counts
+# the lines written to the error log for one reason.  A fallback is logged
+# at most once a second for each reason; the run can cross into the next
+# second, so two lines are allowed.
+
+my @logged = (
+    { description => 'one fallback is logged',
+      tags => ['12:positive'],
+      uris => ['/on/unpaired'], requests => 1,
+      reason => 'companion directive is unpaired or invalid',
+      expected => { min => 1, max => 1 } },
+    { description => 'twenty fallbacks in a second are not all logged',
+      tags => ['12:negative'],
+      uris => ['/on/unpaired'], requests => 20,
+      reason => 'companion directive is unpaired or invalid',
+      expected => { min => 1, max => 2 } },
+    { description => 'a second reason in the same second has its own line',
+      tags => ['12:boundary'],
+      uris => ['/on/unpaired', '/on/missing'], requests => 20,
+      reason => 'response policy excludes it',
+      expected => { min => 1, max => 2 } },
+    { description => 'a response with fine age logs nothing',
+      tags => ['12:corner'],
+      uris => ['/on/b'], requests => 20,
+      reason => '',
+      expected => { min => 0, max => 0 } },
+);
+
 my $t = Test::Nginx->new()->has(qw/http proxy cache rewrite/);
 
 $t->write_file_expand('nginx.conf', <<'CONF');
@@ -234,7 +262,16 @@ sub check {
     }
 }
 
-$t->try_run('no proxy_cache_fine_age_header')->plan(4 * @cases + 8);
+my $error_log = $t->testdir() . '/error.log';
+
+sub log_lines {
+    my ($reason) = @_;
+    open my $in, '<', $error_log or return 0;
+    return scalar grep { /fine cache time not used: \Q$reason\E/ } <$in>;
+}
+
+$t->try_run('no proxy_cache_fine_age_header')
+    ->plan(4 * @cases + 8 + @logged);
 
 ###############################################################################
 
@@ -266,6 +303,22 @@ $response = http_get('/default/e');
 
 is(field($response, 'Age'), 1, 'Age is still reported without Age-Ms');
 is(field($response, 'Age-Ms'), undef, 'Age-Ms stays withheld when stored');
+
+for my $case (@logged) {
+    sleep 1.1;
+    my $before = log_lines($case->{reason});
+
+    for my $i (1 .. $case->{requests}) {
+        http_get($_) for @{ $case->{uris} };
+    }
+
+    my $lines = log_lines($case->{reason}) - $before;
+    my $expected = $case->{expected};
+
+    ok($lines >= $expected->{min} && $lines <= $expected->{max},
+        "$case->{description}: log lines")
+        or diag("$lines lines");
+}
 
 # The time the cache was not running is unaccounted for.  The stored entry
 # is refused, and the variable says why.
