@@ -32,8 +32,16 @@ select STDOUT; $| = 1;
 # origin answers after "delay" milliseconds, one request at a time, and
 # numbers its responses for each URI.
 #
-# expected: origins is the number of origin requests; faster and slower
-# bound the time in milliseconds until the last response.
+# expected: origins is the number of different origin responses the
+# clients received; faster and slower bound the time in milliseconds until
+# the last response.
+#
+# Problem 19: a fetch that ends wakes the waiters in the same worker
+# process.  Without that they look again at 5, 15, 35, 75, 155, 315, 635
+# and 1135 ms, so the delays in those rows end well before the next look
+# and the limits allow for a loaded machine.  In /window/ the response is
+# stale when it arrives and has a stale window: woken together, the
+# waiters are all served it while one of them refreshes it.
 
 my @cases = (
     { description => 'fine time, waiters are answered when the fetch ends',
@@ -45,7 +53,7 @@ my @cases = (
       uri => '/fine/b', delay => 250, clients => 5,
       expected => { origins => 1, faster => 480 } },
     { description => 'stock location still looks again after 500 ms',
-      tags => ['10:negative'],
+      tags => ['10:negative', '19:negative'],
       uri => '/stock/c', delay => 100, clients => 5,
       expected => { origins => 1, slower => 450 } },
     { description => 'fetch ends before the first look',
@@ -56,6 +64,26 @@ my @cases = (
       tags => ['10:boundary'],
       uri => '/fine/e', delay => 8, clients => 5,
       expected => { origins => 1, faster => 300 } },
+    { description => 'waiters are woken when a 330 ms fetch ends',
+      tags => ['19:positive'],
+      uri => '/fine/w1', delay => 330, clients => 5,
+      expected => { origins => 1, faster => 600 } },
+    { description => 'waiters are woken when a 650 ms fetch ends',
+      tags => ['19:positive'],
+      uri => '/fine/w2', delay => 650, clients => 5,
+      expected => { origins => 1, faster => 1100 } },
+    { description => 'fetch ends just after a waiter has looked',
+      tags => ['19:boundary'],
+      uri => '/fine/w3', delay => 160, clients => 5,
+      expected => { origins => 1, faster => 300 } },
+    { description => 'a failed fetch wakes the waiters, which fetch in turn',
+      tags => ['19:corner'],
+      uri => '/fine/fail', delay => 330, clients => 3,
+      expected => { origins => 3, faster => 1400 } },
+    { description => 'stale window serves every waiter of a slow fetch',
+      tags => ['19:corner'],
+      uri => '/window/s', delay => 100, clients => 5,
+      expected => { origins => 1, faster => 400 } },
     { description => 'lock timeout still releases a waiter',
       tags => ['10:corner'],
       uri => '/timeout/f', delay => 200, clients => 3,
@@ -96,6 +124,15 @@ http {
             proxy_cache fine;
             proxy_cache_fine_time origin;
             proxy_cache_lock on;
+        }
+
+        location /window/ {
+            proxy_pass http://127.0.0.1:8081;
+            proxy_cache fine;
+            proxy_cache_fine_time origin;
+            proxy_cache_lock on;
+            proxy_cache_use_stale updating;
+            proxy_cache_background_update on;
         }
 
         location /timeout/ {
@@ -147,6 +184,8 @@ for my $case (@cases) {
     my $elapsed = int((time() - $start) * 1000);
     my $expected = $case->{expected};
 
+    note("$case->{uri}: $elapsed ms, responses " . join(',', sort keys %seen));
+
     is(scalar keys %seen, $expected->{origins},
         "$case->{description}: origin requests");
 
@@ -191,11 +230,14 @@ sub origin {
         sleep($delay / 1000) if $delay;
 
         my $policy = $path =~ m{^/stock/} ? 'max-age=2'
+            : $path =~ m{^/window/} ? 'max-age=0, max-age-ms=50, '
+                . 'stale-while-revalidate=1, stale-while-revalidate-ms=1000'
             : $path =~ m{^/short/} ? 'max-age=0, max-age-ms=50'
             : 'max-age=0, max-age-ms=2000';
 
         my $body = "request $n";
-        print $client "HTTP/1.1 200 OK\x0d\x0a"
+        my $status = $path =~ m{/fail$} ? '502 Bad Gateway' : '200 OK';
+        print $client "HTTP/1.1 $status\x0d\x0a"
             . "Cache-Control: $policy\x0d\x0a"
             . "Content-Length: " . length($body) . "\x0d\x0a"
             . "Connection: close\x0d\x0a\x0d\x0a$body";

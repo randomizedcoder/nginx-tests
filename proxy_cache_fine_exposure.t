@@ -27,7 +27,8 @@ select STDOUT; $| = 1;
 
 # Each row is one request.  Rows for the same URI run in order, so a second
 # row sees the entry the first one stored.  A field that is expected to be
-# absent has the value undef.
+# absent has the value undef.  "want" is sent as the X-Want request field,
+# which the /var/ location uses for proxy_cache_fine_age_header.
 #
 # The cache key is the proxied URI, so each scenario uses its own document.
 
@@ -59,6 +60,36 @@ my @cases = (
       uri => '/hidden/c',
       expected => { cache => 'MISS', fine => 'used',
                     age => qr/^0$/, age_ms => undef } },
+    { description => 'variable set to 1 sends Age-Ms, new entry',
+      tags => ['18:positive'],
+      uri => '/var/h', want => '1',
+      expected => { cache => 'MISS', fine => 'used',
+                    age => qr/^0$/, age_ms => $ms } },
+    { description => 'variable empty withholds Age-Ms from the same entry',
+      tags => ['18:negative', '18:corner'],
+      uri => '/var/h',
+      expected => { cache => 'HIT', fine => 'used',
+                    age => qr/^0$/, age_ms => undef } },
+    { description => 'variable set to 0 withholds Age-Ms',
+      tags => ['18:negative'],
+      uri => '/var/h', want => '0',
+      expected => { cache => 'HIT', fine => 'used',
+                    age => qr/^0$/, age_ms => undef } },
+    { description => 'variable set to off withholds Age-Ms',
+      tags => ['18:negative'],
+      uri => '/var/h', want => 'off',
+      expected => { cache => 'HIT', fine => 'used',
+                    age => qr/^0$/, age_ms => undef } },
+    { description => 'variable set to on sends Age-Ms',
+      tags => ['18:boundary'],
+      uri => '/var/h', want => 'on',
+      expected => { cache => 'HIT', fine => 'used',
+                    age => qr/^0$/, age_ms => $ms } },
+    { description => 'any other value sends Age-Ms',
+      tags => ['18:corner'],
+      uri => '/var/h', want => 'cache-7',
+      expected => { cache => 'HIT', fine => 'used',
+                    age => qr/^0$/, age_ms => $ms } },
     { description => 'whole-second response, new entry',
       uri => '/on/coarse',
       expected => { cache => 'MISS', fine => 'coarse',
@@ -147,6 +178,38 @@ my @logged = (
       expected => { min => 0, max => 0 } },
 );
 
+# Each row stores an entry, and the server is then stopped and started.
+# "change" is made to the offset kept in the cache file while the server is
+# stopped: a number of milliseconds added to it, or "zero" for a file
+# written before the offset was kept.
+
+my @restart = (
+    { description => 'entry is reused after a restart',
+      tags => ['16:positive'],
+      uri => '/on/restart/kept', change => undef,
+      expected => { cache => 'HIT', fine => 'used' } },
+    { description => 'offset 5 ms away is within the limit',
+      tags => ['16:boundary'],
+      uri => '/on/restart/near', change => 5,
+      expected => { cache => 'HIT', fine => 'used' } },
+    { description => 'offset 50 ms away is refused',
+      tags => ['16:negative'],
+      uri => '/on/restart/step', change => 50,
+      expected => { cache => 'EXPIRED', fine => 'clock' } },
+    { description => 'offset 50 ms behind is refused',
+      tags => ['16:negative'],
+      uri => '/on/restart/back', change => -50,
+      expected => { cache => 'EXPIRED', fine => 'clock' } },
+    { description => 'file without an offset is refused',
+      tags => ['16:corner'],
+      uri => '/on/restart/none', change => 'zero',
+      expected => { cache => 'EXPIRED', fine => 'clock' } },
+    { description => 'entry past its lifetime at the restart is only expired',
+      tags => ['16:corner'],
+      uri => '/on/brief', change => undef,
+      expected => { cache => 'EXPIRED', fine => 'used' } },
+);
+
 my $t = Test::Nginx->new()->has(qw/http proxy cache rewrite/);
 
 $t->write_file_expand('nginx.conf', <<'CONF');
@@ -180,6 +243,11 @@ http {
             proxy_cache_fine_age_header on;
             proxy_hide_header Age-Ms;
         }
+        location /var/ {
+            proxy_pass http://127.0.0.1:8081/;
+            proxy_cache_fine_time origin;
+            proxy_cache_fine_age_header $http_x_want;
+        }
         location /off/ {
             proxy_pass http://127.0.0.1:8081/;
         }
@@ -200,6 +268,10 @@ http {
 
         location / {
             add_header Cache-Control 'max-age=0, max-age-ms=60000';
+            return 200 'manifest';
+        }
+        location = /brief {
+            add_header Cache-Control 'max-age=0, max-age-ms=200';
             return 200 'manifest';
         }
         location = /coarse {
@@ -270,13 +342,42 @@ sub log_lines {
     return scalar grep { /fine cache time not used: \Q$reason\E/ } <$in>;
 }
 
+# Change the offset kept in the cache file of a URI.  It is the last four
+# bytes of the fixed header, which is 336 bytes long.
+
+my $cache_dir = $t->testdir() . '/cache';
+
+sub offset_change {
+    my ($uri, $change) = @_;
+    my ($name) = $uri =~ m{^/on(/.*)$};
+
+    for my $file (glob("$cache_dir/*")) {
+        open my $fh, '+<:raw', $file or die "Open $file: $!";
+        read($fh, my $head, 1024);
+        next unless $head =~ /\nKEY: \S+\Q$name\E\n/;
+
+        my $offset = unpack('L', substr($head, 332, 4));
+        $offset = $change eq 'zero' ? 0 : ($offset + $change) % 2 ** 32;
+
+        seek($fh, 332, 0);
+        print $fh pack('L', $offset);
+        close $fh;
+        return;
+    }
+
+    die "No cache file for $uri";
+}
+
 $t->try_run('no proxy_cache_fine_age_header')
-    ->plan(4 * @cases + 8 + @logged);
+    ->plan(4 * @cases + 5 + @logged + 3 * @restart);
 
 ###############################################################################
 
 for my $case (@cases) {
-    my $response = http_get($case->{uri});
+    my $response = defined $case->{want}
+        ? http("GET $case->{uri} HTTP/1.0\nHost: localhost\n"
+            . "X-Want: $case->{want}\n\n")
+        : http_get($case->{uri});
     my $expected = $case->{expected};
 
     check($response, 'X-Cache', $expected->{cache}, $case->{description});
@@ -320,17 +421,45 @@ for my $case (@logged) {
         or diag("$lines lines");
 }
 
-# The time the cache was not running is unaccounted for.  The stored entry
-# is refused, and the variable says why.
+# The cache file keeps the difference between the wall clock and the
+# monotonic clock when the entry was stored.  It is the same after a restart
+# of this server, so the entry is reused and its age carries on.  Where it
+# differs, as after a clock step or a reboot, the entry is refused.
 
+my %stored;
+
+for my $case (@restart) {
+    $stored{$case->{uri}} = Time::HiRes::time();
+    http_get($case->{uri});
+}
+
+sleep 0.3;
 $t->stop();
+
+for my $case (@restart) {
+    offset_change($case->{uri}, $case->{change}) if defined $case->{change};
+}
+
 $t->run();
 
-$response = http_get('/on/b');
+for my $case (@restart) {
+    my $expected = $case->{expected};
+    $response = http_get($case->{uri});
+    my $elapsed = int((Time::HiRes::time() - $stored{$case->{uri}}) * 1000);
 
-is(field($response, 'X-Cache'), 'EXPIRED', 'entry refused after a restart');
-is(field($response, 'X-Fine'), 'clock', 'refusal is reported as clock');
-is(field(http_get('/on/b'), 'X-Fine'), 'used',
-    'refetched entry uses fine age');
+    check($response, 'X-Cache', $expected->{cache}, $case->{description});
+    check($response, 'X-Fine', $expected->{fine}, $case->{description});
+
+    my $age_ms = field($response, 'Age-Ms') // -1;
+
+    if ($expected->{cache} eq 'HIT') {
+        ok($age_ms >= 300 && $age_ms <= $elapsed + 20,
+            "$case->{description}: age carries on")
+            or diag("Age-Ms $age_ms, elapsed $elapsed");
+
+    } else {
+        cmp_ok($age_ms, '<', 300, "$case->{description}: age starts again");
+    }
+}
 
 ###############################################################################

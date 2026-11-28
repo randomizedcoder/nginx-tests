@@ -93,12 +93,13 @@ for my $case (@cases) {
 
 $t->stop();
 $t->run();
-# The time the cache was not running is unaccounted for, so a stored fine
-# entry is fetched again and not reused or served stale.
-like(http_get('/paired'), qr/^X-Cache: EXPIRED\r?$/mi,
-    'fine cache entry is not reused after restart');
+# The cache file keeps the clock offset, so a stored fine entry is reused
+# after a restart of this server.  proxy_cache_fine_exposure.t has the
+# rows for an offset that has changed.
 like(http_get('/paired'), qr/^X-Cache: HIT\r?$/mi,
-    'entry fetched after restart is reused');
+    'fine cache entry is reused after restart');
+like(http_get('/paired'), qr/^X-Cache: HIT\r?$/mi,
+    'and reused again');
 
 like(http_get('/validate'), qr/^X-Cache: MISS\r?$/mi, 'fill conditional entry');
 my $deadline = time() + 5;

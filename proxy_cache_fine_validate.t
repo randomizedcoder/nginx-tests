@@ -106,6 +106,40 @@ my @cases = (
                     later => 'HIT' } },
 );
 
+# Each row stores a response with a 60 s lifetime.  The server is then
+# stopped, "change" milliseconds are added to the clock offset kept in the
+# cache file, as a step of the clock would, and the server is started.
+#
+# expected: first is the status of the first request after that, next the
+# status of the one after, and origin the number of origin requests that
+# one causes.
+
+my $long = 'max-age=0, max-age-ms=60000';
+
+my @clock = (
+    { description => 'offset unchanged, entry is reused without a request',
+      tags => ['16:positive'],
+      uri => '/fine/clock/kept', change => 0,
+      fields => { cc => $long, etag => '"v1"', date => '07' },
+      expected => { first => 'HIT', next => 'HIT', origin => 0 } },
+    { description => 'refused entry is validated and kept by a 304',
+      tags => ['16:corner'],
+      uri => '/fine/clock/step', change => 50,
+      fields => { cc => $long, etag => '"v1"', date => '07' },
+      expected => { first => 'REVALIDATED', next => 'HIT', origin => 0 } },
+    { description => 'refused entry, 304 of another length, is retired',
+      tags => ['16:negative'],
+      uri => '/fine/clock/longer', change => 50,
+      fields => { cc => 'max-age=0, max-age-ms=600000', etag => '"v1"',
+                  date => '07' },
+      expected => { first => 'REVALIDATED', next => 'MISS', origin => 1 } },
+    { description => 'refused entry, 304 without fields, is kept',
+      tags => ['16:boundary'],
+      uri => '/fine/clock/bare', change => -50,
+      fields => { etag => '"v1"' },
+      expected => { first => 'REVALIDATED', next => 'HIT', origin => 0 } },
+);
+
 my $t = Test::Nginx->new()->has(qw/http proxy cache/);
 
 $t->write_file_expand('nginx.conf', <<'CONF');
@@ -138,10 +172,10 @@ http {
 CONF
 
 my $log = $t->testdir() . '/origin.log';
-my %fields = map { $_->{uri} => $_->{fields} } @cases;
+my %fields = map { $_->{uri} => $_->{fields} } @cases, @clock;
 
-$t->run_daemon(\&origin, $log, \%fields, $policy);
-$t->try_run('no proxy_cache_fine_time')->plan(6 * @cases);
+$t->run_daemon(\&origin, $log, \%fields, $policy, $long);
+$t->try_run('no proxy_cache_fine_time')->plan(6 * @cases + 4 * @clock);
 $t->waitforsocket('127.0.0.1:' . port(8081));
 
 ###############################################################################
@@ -180,10 +214,55 @@ for my $case (@cases) {
         "$case->{description}: 400 ms later");
 }
 
+# A fine entry is refused when the clock offset has changed.  It is then
+# validated like an expired one, and a 304 keeps it.
+
+my $cache_dir = $t->testdir() . '/cache';
+
+sub offset_change {
+    my ($uri, $change) = @_;
+
+    for my $file (glob("$cache_dir/*")) {
+        open my $fh, '+<:raw', $file or die "Open $file: $!";
+        read($fh, my $head, 1024);
+        next unless $head =~ /\nKEY: \S+\Q$uri\E\n/;
+
+        # The offset is the last four bytes of the 336-byte fixed header.
+        my $offset = (unpack('L', substr($head, 332, 4)) + $change) % 2 ** 32;
+
+        seek($fh, 332, 0);
+        print $fh pack('L', $offset);
+        close $fh;
+        return;
+    }
+
+    die "No cache file for $uri";
+}
+
+is(cache(http_get($_->{uri})), 'MISS', "$_->{description}: fill") for @clock;
+
+$t->stop();
+offset_change($_->{uri}, $_->{change}) for @clock;
+$t->run();
+
+for my $case (@clock) {
+    my ($uri, $expected) = @$case{qw/uri expected/};
+
+    is(cache(http_get($uri)), $expected->{first},
+        "$case->{description}: first request");
+
+    my $before = origins($uri);
+
+    is(cache(http_get($uri)), $expected->{next},
+        "$case->{description}: next request");
+    is(origins($uri) - $before, $expected->{origin},
+        "$case->{description}: origin requests");
+}
+
 ###############################################################################
 
 sub origin {
-    my ($log, $fields, $policy) = @_;
+    my ($log, $fields, $policy, $long) = @_;
 
     my $server = IO::Socket::INET->new(
         Proto => 'tcp',
@@ -223,7 +302,8 @@ sub origin {
             my $body = 'manifest';
             print $client "HTTP/1.1 200 OK\x0d\x0a"
                 . "Date: ${date}00 GMT\x0d\x0a"
-                . 'Cache-Control: ' . ($stock ? 'max-age=1' : $policy)
+                . 'Cache-Control: ' . ($stock ? 'max-age=1'
+                    : $uri =~ m{/clock/} ? $long : $policy)
                 . "\x0d\x0a"
                 . "ETag: \"v1\"\x0d\x0a"
                 . "Content-Length: " . length($body) . "\x0d\x0a"
